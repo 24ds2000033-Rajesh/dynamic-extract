@@ -1,15 +1,15 @@
 import os
 import json
-from datetime import date
-from typing import Any, Dict, List, Optional
+from datetime import datetime, date
+from typing import Dict, Any, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, create_model, Field
+from pydantic import BaseModel, Field
 from openai import OpenAI
 
 app = FastAPI(title="DataBridge Dynamic ETL Pipeline")
 
-# Enable CORS as requested by the specification
+# Enable CORS as required
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,19 +18,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize OpenAI Client (Will naturally read OPENAI_API_KEY from environment vars)
 client = OpenAI()
 
-# Strict mapping of incoming user string schemas to proper Python/Pydantic validation types
-# By default, all fields allow None (null) if they are missing from the parsed text source.
-TYPE_MAPPING = {
-    "string": (Optional[str], Field(default=None)),
-    "integer": (Optional[int], Field(default=None)),
-    "float": (Optional[float], Field(default=None)),
-    "boolean": (Optional[bool], Field(default=None)),
-    "date": (Optional[date], Field(default=None)),
-    "array[string]": (Optional[List[str]], Field(default=None)),
-    "array[integer]": (Optional[List[int]], Field(default=None)),
+# Strict translation mapping from requested strings to raw OpenAI JSON Schema types
+# Notice how we represent optional fields strictly using the allowed ["type", "null"] array format!
+OPENAI_TYPE_MAP = {
+    "string": {"type": ["string", "null"]},
+    "integer": {"type": ["integer", "null"]},
+    "float": {"type": ["number", "null"]},
+    "boolean": {"type": ["boolean", "null"]},
+    "date": {"type": ["string", "null"], "description": "ISO date string formatted as YYYY-MM-DD"},
+    "array[string]": {"type": ["array", "null"], "items": {"type": "string"}},
+    "array[integer]": {"type": ["array", "null"], "items": {"type": "integer"}},
 }
 
 class ExtractionRequest(BaseModel):
@@ -46,33 +45,33 @@ async def dynamic_extract(payload: ExtractionRequest):
     text = payload.text
     schema_def = payload.schema_def
 
-    # 1. Dynamically build the validation fields map at runtime
-    fields = {}
+    # 1. Manually build the target properties structure to be 100% compliant with OpenAI Strict Mode
+    properties = {}
     for field_name, type_str in schema_def.items():
-        if type_str not in TYPE_MAPPING:
+        if type_str not in OPENAI_TYPE_MAP:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"Unsupported type '{type_str}' for field '{field_name}'"
             )
-        fields[field_name] = TYPE_MAPPING[type_str]
+        # Deep copy the schema fragment
+        properties[field_name] = dict(OPENAI_TYPE_MAP[type_str])
 
-    # Create the dedicated runtime validation model
-    DynamicModel = create_model("DynamicExtractionModel", **fields)
-
-    # 2. Extract a JSON schema definition directly into OpenAI's Strict Structured Outputs format
-    json_schema = DynamicModel.model_json_schema()
-    
-    # Force OpenAI to treat all keys as strictly required (they can still have null values)
-    json_schema["required"] = list(schema_def.keys())
-    json_schema["additionalProperties"] = False  # Strict rule alignment
+    # 2. Build the perfect base JSON Schema definition matching OpenAI guidelines
+    json_schema = {
+        "type": "object",
+        "properties": properties,
+        "required": list(schema_def.keys()), # Strict mode mandates all fields exist in the required array
+        "additionalProperties": False        # Strict mode mandates additionalProperties is explicitly false
+    }
 
     prompt = (
         "You are an expert data extraction agent. Analyze the provided text source and populate "
-        "every single field in the target schema structure. "
+        "every single field in the target schema. "
         "Rules:\n"
-        "- If a field is not present or cannot be extracted from the text, you MUST populate it as null.\n"
+        "- If a field is not present or cannot be explicitly found in the text, you MUST return null for that field.\n"
         "- Dates must strictly follow ISO format: YYYY-MM-DD.\n"
-        "- Do not make up information."
+        "- Numbers/integers must be valid JSON numeric outputs, not strings.\n"
+        "- Do not extrapolate or hallucinate data."
     )
 
     try:
@@ -95,17 +94,56 @@ async def dynamic_extract(payload: ExtractionRequest):
         )
 
         raw_content = response.choices[0].message.content
-        extracted_json = json.loads(raw_content)
+        extracted_data = json.loads(raw_content)
 
-        # 4. Coerce data types using the dynamically generated Pydantic model
-        # This converts strings into Python numbers/dates natively, verifying structural integrity
-        validated_data = DynamicModel(**extracted_json)
+        # 4. Runtime type conversion & coercion logic
+        # OpenAI guarantees keys match perfectly. Now we safely validate contents before returning.
+        final_output = {}
+        for field_name, type_str in schema_def.items():
+            val = extracted_data.get(field_name)
+            
+            if val is None:
+                final_output[field_name] = None
+                continue
 
-        # 5. Return native serialization compliant with standard endpoint structures (dates -> strings)
-        return validated_data.model_dump(mode="json")
+            try:
+                if type_str == "integer":
+                    final_output[field_name] = int(val)
+                elif type_str == "float":
+                    final_output[field_name] = float(val)
+                elif type_str == "boolean":
+                    if isinstance(val, str):
+                        final_output[field_name] = val.lower() in ("true", "1", "yes")
+                    else:
+                        final_output[field_name] = bool(val)
+                elif type_str == "date":
+                    # Coerce dates cleanly into YYYY-MM-DD text formats
+                    if isinstance(val, str):
+                        # Strip accidental time increments if present, ensuring formatting validation
+                        cleaned_date = val.split("T")[0].strip()
+                        # Verify integrity by parsing it
+                        parsed_date = datetime.strptime(cleaned_date, "%Y-%m-%d").date()
+                        final_output[field_name] = parsed_date.isoformat()
+                    else:
+                        final_output[field_name] = None
+                elif type_str == "array[integer]":
+                    final_output[field_name] = [int(x) for x in val if x is not None]
+                elif type_str == "array[string]":
+                    final_output[field_name] = [str(x) for x in val if x is not None]
+                else:
+                    final_output[field_name] = str(val)
+            except Exception:
+                # Fallback to null safely if format parsing or coercion encounters a breakdown
+                final_output[field_name] = None
+
+        return final_output
 
     except Exception as e:
+        # Include the inner exception message to make any validation or API errors explicit in the logs
         raise HTTPException(status_code=500, detail=f"Dynamic extraction failed: {str(e)}")
 
 
-# CRITICAL FIX:
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
