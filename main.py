@@ -1,7 +1,7 @@
 import os
 import json
-from datetime import datetime, date
-from typing import Dict, Any, List
+from datetime import datetime
+from typing import Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -9,7 +9,7 @@ from openai import OpenAI
 
 app = FastAPI(title="DataBridge Dynamic ETL Pipeline")
 
-# Enable CORS as required
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,16 +20,38 @@ app.add_middleware(
 
 client = OpenAI()
 
-# Strict translation mapping from requested strings to raw OpenAI JSON Schema types
-# Notice how we represent optional fields strictly using the allowed ["type", "null"] array format!
+# 100% Compliant OpenAI Strict JSON Schema definitions using anyOf for nullable fields
 OPENAI_TYPE_MAP = {
-    "string": {"type": ["string", "null"]},
-    "integer": {"type": ["integer", "null"]},
-    "float": {"type": ["number", "null"]},
-    "boolean": {"type": ["boolean", "null"]},
-    "date": {"type": ["string", "null"], "description": "ISO date string formatted as YYYY-MM-DD"},
-    "array[string]": {"type": ["array", "null"], "items": {"type": "string"}},
-    "array[integer]": {"type": ["array", "null"], "items": {"type": "integer"}},
+    "string": {
+        "anyOf": [{"type": "string"}, {"type": "null"}]
+    },
+    "integer": {
+        "anyOf": [{"type": "integer"}, {"type": "null"}]
+    },
+    "float": {
+        "anyOf": [{"type": "number"}, {"type": "null"}]
+    },
+    "boolean": {
+        "anyOf": [{"type": "boolean"}, {"type": "null"}]
+    },
+    "date": {
+        "anyOf": [
+            {"type": "string", "description": "ISO date string formatted as YYYY-MM-DD"},
+            {"type": "null"}
+        ]
+    },
+    "array[string]": {
+        "anyOf": [
+            {"type": "array", "items": {"type": "string"}},
+            {"type": "null"}
+        ]
+    },
+    "array[integer]": {
+        "anyOf": [
+            {"type": "array", "items": {"type": "integer"}},
+            {"type": "null"}
+        ]
+    },
 }
 
 class ExtractionRequest(BaseModel):
@@ -45,7 +67,7 @@ async def dynamic_extract(payload: ExtractionRequest):
     text = payload.text
     schema_def = payload.schema_def
 
-    # 1. Manually build the target properties structure to be 100% compliant with OpenAI Strict Mode
+    # 1. Manually build the target properties structure to be compliant with OpenAI Strict Mode
     properties = {}
     for field_name, type_str in schema_def.items():
         if type_str not in OPENAI_TYPE_MAP:
@@ -53,20 +75,19 @@ async def dynamic_extract(payload: ExtractionRequest):
                 status_code=400,
                 detail=f"Unsupported type '{type_str}' for field '{field_name}'"
             )
-        # Deep copy the schema fragment
-        properties[field_name] = dict(OPENAI_TYPE_MAP[type_str])
+        properties[field_name] = OPENAI_TYPE_MAP[type_str]
 
     # 2. Build the perfect base JSON Schema definition matching OpenAI guidelines
     json_schema = {
         "type": "object",
         "properties": properties,
-        "required": list(schema_def.keys()), # Strict mode mandates all fields exist in the required array
-        "additionalProperties": False        # Strict mode mandates additionalProperties is explicitly false
+        "required": list(schema_def.keys()),  # Strict mode requires all properties to be declared here
+        "additionalProperties": False        # Strict mode requires additionalProperties to be false
     }
 
     prompt = (
         "You are an expert data extraction agent. Analyze the provided text source and populate "
-        "every single field in the target schema. "
+        "every single field in the target schema.\n\n"
         "Rules:\n"
         "- If a field is not present or cannot be explicitly found in the text, you MUST return null for that field.\n"
         "- Dates must strictly follow ISO format: YYYY-MM-DD.\n"
@@ -75,7 +96,7 @@ async def dynamic_extract(payload: ExtractionRequest):
     )
 
     try:
-        # 3. Call OpenAI using native strict schema validation parameters
+        # 3. Call OpenAI using strict schema validation parameters
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -97,7 +118,6 @@ async def dynamic_extract(payload: ExtractionRequest):
         extracted_data = json.loads(raw_content)
 
         # 4. Runtime type conversion & coercion logic
-        # OpenAI guarantees keys match perfectly. Now we safely validate contents before returning.
         final_output = {}
         for field_name, type_str in schema_def.items():
             val = extracted_data.get(field_name)
@@ -117,11 +137,8 @@ async def dynamic_extract(payload: ExtractionRequest):
                     else:
                         final_output[field_name] = bool(val)
                 elif type_str == "date":
-                    # Coerce dates cleanly into YYYY-MM-DD text formats
                     if isinstance(val, str):
-                        # Strip accidental time increments if present, ensuring formatting validation
                         cleaned_date = val.split("T")[0].strip()
-                        # Verify integrity by parsing it
                         parsed_date = datetime.strptime(cleaned_date, "%Y-%m-%d").date()
                         final_output[field_name] = parsed_date.isoformat()
                     else:
@@ -133,13 +150,14 @@ async def dynamic_extract(payload: ExtractionRequest):
                 else:
                     final_output[field_name] = str(val)
             except Exception:
-                # Fallback to null safely if format parsing or coercion encounters a breakdown
+                # Fallback to null safely if format parsing encounters a breakdown
                 final_output[field_name] = None
 
         return final_output
 
     except Exception as e:
-        # Include the inner exception message to make any validation or API errors explicit in the logs
+        # Crucial: Prints the actual underlying error trace in your Render logs for visibility
+        print(f"Extraction exception caught: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Dynamic extraction failed: {str(e)}")
 
 
